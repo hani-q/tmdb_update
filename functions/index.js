@@ -1,34 +1,36 @@
 'use strict';
 
+const date = new Date();
+
 const functions = require('firebase-functions');
 const admin = require('firebase-admin');
-var defaultApp = admin.initializeApp(functions.config().firebase);
-var defaultDatabase = defaultApp.database();
+const async = require("async");
+const Client = require('node-rest-client').Client;
+const sleep = require('sleep');
 const secureCompare = require('secure-compare');
-const page_width = 250
+
 // Imports the Google Cloud client library
 const PubSub = require('@google-cloud/pubsub');
+// Instantiates a pubsub client
+const pubsub = PubSub({projectId: 'anime-db-bab96'});
 
-global.data = [];
+var defaultApp = admin.initializeApp(functions.config().firebase);
+var defaultDatabase = defaultApp.database();
 
-// Your Google Cloud Platform project ID
-const projectId = 'anime-db-bab96';
-
-// Instantiates a client
-const pubsub = PubSub({
-  projectId: projectId
-});
+global.all_data = [];
+global.data_info = {};
+global.failed_pages = [];
 
 // The name for the new topic
 const topicName = 'tmdb';
 
-var Client = require('node-rest-client').Client;
+// Initiate rest Client
 var client = new Client();
-// API key
-//TODO(Hani Q) need to fetch this from Remote Config
-const key = '2410f30eccdd2c2aa45c44dd6c5603a9';
+
+// Read API key from firbase env config
+const key = functions.config().tmdb.key;
 const base_url = 'http://api.themoviedb.org/3/discover/movie?language=en-US&with_genres=16,12%7C35%7C10751&sort_by=popularity.desc&include_adult=false&api_key=' + key + '&page=';
-var sleep = require('sleep');
+
 /**
  * When requested this Function will just public a message on 'tmdb' topic.
  * The request needs to be authorized by passing a 'key' query parameter in the URL. This key must
@@ -58,9 +60,19 @@ exports.tmdbUpdate = functions.https.onRequest((req, res) => {
         return;
     });
 
-    // Publish 'start' message on topic for update function to start
-    publishMessage(topicName, "start");
-    res.send("Db Update Started in Background")
+    var url = base_url + 1;
+    console.log("Getting Data from [" + url + "]");
+    client.get(url, (data, response) => {
+        // Publish 'start' message on topic for update function to start
+        var total_pages = data.total_pages;
+        var total_results = data.total_results;
+        console.log("Sending message to fetch Pages=" + total_pages + " Results=" + total_results);
+        publishMessage(topicName, {"total_pages": total_pages, "total_results": total_results});
+    }).on('error', (err) => {
+        console.log('something went wrong on the request, please restart', err.request.options);
+    });
+
+    res.send("DB update started in Background")
 });
 
 /**
@@ -70,10 +82,9 @@ exports.tmdbUpdate = functions.https.onRequest((req, res) => {
  */
 exports.tmdbUpdatePubSub = functions.pubsub.topic('tmdb').onPublish(event => {
     const pubSubMessage = event.data;
+
     // Decode the PubSub Message body.
     const messageBody = pubSubMessage.data ? Buffer.from(pubSubMessage.data, 'base64').toString() : null;
-
-    // Print the message in the logs.
     console.log(`Message recieved ${messageBody || ''}`);
 
     // //console.log('Emptying DB');
@@ -81,109 +92,156 @@ exports.tmdbUpdatePubSub = functions.pubsub.topic('tmdb').onPublish(event => {
     // moviesRef.remove();
     // moviesRef.off();
 
-    if (messageBody.localeCompare('start') != 0) {
-        console.error.message("message should be start");
-        return 409;
+    // Array to hold async tasks
+    var asyncTasks = [];
+
+    var page = 0;
+    global.data_info = JSON.parse(messageBody);
+    var total_pages = global.data_info.total_pages;
+
+    var total_results = global.data_info.total_results;
+    var problem_pages = [];
+
+    console.log('Started fetching Movies');
+    console.log('Total Pages ' + total_pages);
+
+    // Loop total no of pages times
+    for (var i = 0; i < total_pages; i++) {
+        // We don't actually execute the async action here
+        // We add a function containing it to an array of "tasks"
+        asyncTasks.push((callback) => {
+            page++;
+
+            //Adding a random sleep to each call
+            //var sleep_int = getRandomInt(1,6);
+            //var sleep_int = "N/A";
+            console.log("Processing Page " + page);
+            //sleep.sleep(sleep_int);
+
+            var url = base_url + page;
+            client.get(url, (data, response) => {
+
+                // Get rateLimit from Raw Header
+                var ratelimit = response.rawHeaders[27];
+
+                // console.log(response.rawHeaders[26] + ' ' + response.rawHeaders[27]);
+                if (ratelimit == 2) {
+                    // Rate Limit Exceeded wait 10 seconds
+                   console.log("Rate Limited Exceeded");
+
+                   // Sleep 10 Seconds to reset Rate Limit
+                   sleep.sleep(10);
+                }
+
+                global.all_data = global.all_data.concat(data.results);
+                callback();
+            }).on('error', (err) => {
+                // Retrying once more before failure
+                var eurl = err.request.options.href;
+                console.log('Something went wrong on the request', err.request.options);
+                problem_pages.push(eurl);
+                sleep.sleep(2);
+                client.get(eurl, (data, response) => {
+                    console.log("Retrying url " + eurl);
+                    global.all_data = global.all_data.concat(data.results);
+                    callback();
+                }).on('error', (err) => {
+                    global.all_data = global.all_data.concat(data.results);
+                    var queryData = url.parse(eurl, true).query;
+                    global.failed_pages.push(query.page);
+                    console.log("Permanent Failure on Page " + page);
+                    var date_string = date.toISOString();
+                    var datim = Math.round(date/1000);
+                    var statusRef = defaultDatabase.ref("v1/status");
+                    statusRef.update({
+                                        "status": "failed",
+                                        "timestamp": date_string,
+                                        "failed_pages": failed_pages,
+                                        "records_fetched": 0,
+                                        "records_expected": global.data_info.total_results,
+                                        "total_pages": global.data_info.total_page
+                                    });
+                    statusRef.off();
+                    throw new Error("Perma Fail on " + query.page);
+                });
+            });
+        });
     }
 
-    // // Get Total Pages
-    var url = base_url + 1;;
-
-    client.get(url, function (data, response) {
-
-        console.log('Total Pages ' + data.total_pages);
-        console.log('Started fetching Movies');
-        // Calling fucntion to get datail
-
-
-        var last_end = 1;
-        var end = 1;
-
-        for(var i = 1; i <= data.total_pages; ) {
-            if(i + page_width > data.total_pages)
-                end = data.total_pages;
-            else
-                end = i + page_width - 1;
-
-            console.log(`Fetching from ${i} - ${end}`);
-            get_data(i, end, results);
-
-            i = i + page_width;
-            // last_end = end;
-        }
-        return;
-    });
-    return;
+    //Execute the TaskArray in parallel
+    const limit = functions.config().exec.limit;
+    console.log("Starting || execution [limit " + limit + "]");
+    async.parallelLimit(asyncTasks, limit, movie_results);
 });
 
+
+
+function getRandomInt(min, max) {
+    min = Math.ceil(min);
+    max = Math.floor(max);
+    return Math.floor(Math.random() * (max - min)) + min;
+}
 
 /**
  * When called this will publish the message on a specific topic
  */
 function publishMessage (topicName, data) {
+    const topic = pubsub.topic(topicName);
 
-  const topic = pubsub.topic(topicName);
-
-  // Publishes the message
-  return topic.publish(data)
-    .then((results) => {
+    // Publishes the message
+    return topic.publish(data).then((results) => {
         const messageIds = results[0];
         console.log(`Message ${messageIds[0]} published.`);
         return messageIds;
     });
 }
 
-/**
- * When called this will call the Movie DB API with Auth Key.
- */
-function get_data (page, end, callback) {
-    var job = page;
-    var url = base_url + page;
 
-    client.get(url, function (data, response) {
-
-        // Get rateLimit from Raw Header
-        var ratelimit = response.rawHeaders[27];
-
-        // console.log(response.rawHeaders[26] + ' ' + response.rawHeaders[27]);
-        if (ratelimit == 2) {
-            // Rate Limit Exceeded wait 10 seconds
-           console.log("Rate Limited Exceeded");
-
-           // Sleep 10 Seconds to reset Rate Limit
-           sleep.sleep(10);
-        }
-
-        console.log('Page ' + page + '/' + end);
-
-        global.data.push(data.results);
-        page = page + 1;
-        if (page <= end) {
-            sleep.sleep(2);
-            get_data(page, end, results);
-            return;
-        }
-        callback(job);
-        return;
-    });
-    return;
-}
-
-function results (page) {
-    console.log('Total Pages so far = ' + Object.keys(global.data).length);
+function movie_results () {
     var moviesRef = defaultDatabase.ref("v1/movies");
+    ;
+
     //moviesRef.remove();
     var data_json = {};
-    for (var i = 0; i < global.data.length; i++) {
-        for (var j = 0; j < global.data[i].length; j ++) {
-            var res_array = global.data[i];
-            var toon = res_array[j];
-            data_json[toon.id] = toon;
+
+    console.log("Total Movies fetched " + global.all_data.length);
+
+    async.each(global.all_data,
+        (mov, cb) => {
+            data_json[mov.id] = mov;
+            cb();
+            },
+        () => {
+            var data_len = Object.keys(data_json).length;
+            console.log("Result post-processing done");
+            console.log("Total = " + data_len + " | Expected = " + global.data_info.total_results);
+            console.log("Uploading to Firebase Datastore");
+            moviesRef.update(data_json);
+
+            console.log("Finished fetching movies");
+
+            // Update status for this job on status DB
+            console.log("Updating Status");
+            var date_string = date.toISOString();
+            var datim = Math.round(date/1000);
+            var statusRef = defaultDatabase.ref("v1/status");
+            statusRef.update({
+                                "status": "passed",
+                                "records_fetched": data_len,
+                                "records_expected": global.data_info.total_results,
+                                "total_pages": global.data_info.total_pages,
+                                "timestamp": date_string,
+                                "failed_pages": failed_pages
+                            });
+
+            // Closing all db references
+            console.log("Closing DB handles");
+            moviesRef.off();
+            statusRef.off();
+            console.log("All Done");
         }
-        break;
-    }
-    moviesRef.update(data_json);
-    moviesRef.off();
-    console.log("finished fetching movies for job" + page);
-    return;
+    );
 }
+
+
+

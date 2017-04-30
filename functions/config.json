@@ -1,0 +1,14 @@
+{
+  "tmdb": {
+    "key": "2410f30eccdd2c2aa45c44dd6c5603a9"
+  },
+  "cron": {
+    "key": "25e6ead2580f1eb094cd05de6101050cb10d6d6a"
+  },
+  "firebase": {
+    "databaseURL": "https://anime-db-bab96.firebaseio.com",
+    "storageBucket": "anime-db-bab96.appspot.com",
+    "apiKey": "AIzaSyCDDlCwXILYbv-yjlW9PDZs6wGZ0SkDt4g",
+    "authDomain": "anime-db-bab96.firebaseapp.com"
+  }
+}
